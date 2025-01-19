@@ -1,87 +1,102 @@
 import requests
+import zipfile
+import json
+import io
 import os
-import time
+from dotenv import load_dotenv
+import pandas as pd
 
-# Set your Qualtrics details here
-CLIENT_ID = os.environ.get("QUALTRICS_CLIENT_ID")  # Replace with your client ID
-CLIENT_SECRET = os.environ.get("QUALTRICS_CLIENT_SECRET")  # Replace with your client secret
-DATA_CENTER = "sjc1"  # Replace with your Qualtrics data center (e.g., "sjc1", "iad1")
-SURVEY_ID = "SV_abc123XYZ"  # Replace with your survey ID
+# Load environment variables
+load_dotenv()
 
-# Token endpoint and API endpoints
-TOKEN_URL = f"https://{DATA_CENTER}.qualtrics.com/oauth2/token"
-EXPORT_URL = f"https://{DATA_CENTER}.qualtrics.com/API/v3/surveys/{SURVEY_ID}/export-responses"
 
-def get_access_token(client_id, client_secret):
+def export_survey(api_token: str, survey_id: str, data_center: str, file_format: str) -> str:
     """
-    Generate an OAuth token using Client ID and Client Secret.
+    Export survey responses from Qualtrics API.
+    Returns the path to the downloaded CSV file.
     """
-    payload = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
+    base_url = f"https://{data_center}.qualtrics.com/API/v3/surveys/{survey_id}/export-responses/"
+    headers = {
+        "Content-Type": "application/json",
+        "X-API-TOKEN": api_token,
     }
-    response = requests.post(TOKEN_URL, data=payload)
-    response.raise_for_status()
-    return response.json()["access_token"]
 
-def export_survey_responses(access_token):
-    """
-    Initiate the export of survey responses.
-    """
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    payload = {"format": "csv"}
-    response = requests.post(EXPORT_URL, json=payload, headers=headers)
+    # Step 1: Initiating data export
+    download_request_payload = {
+        "format": file_format,
+        "useLabels": True  # Use human-readable labels
+    }
+
+    response = requests.post(base_url, json=download_request_payload, headers=headers)
     response.raise_for_status()
     progress_id = response.json()["result"]["progressId"]
-    print(f"Export initiated. Progress ID: {progress_id}")
-    return progress_id
 
-def check_export_progress(access_token, progress_id):
-    """
-    Check the progress of the export.
-    """
-    url = f"{EXPORT_URL}/{progress_id}"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    while True:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        progress_status = response.json()["result"]["status"]
-        print(f"Progress: {progress_status}")
-        if progress_status == "complete":
-            file_url = response.json()["result"]["fileUrl"]
-            print(f"Export complete. File available at: {file_url}")
-            return file_url
-        elif progress_status == "failed":
+    # Step 2: Checking export progress
+    progress_status = "inProgress"
+    while progress_status not in ["complete", "failed"]:
+        progress_url = f"{base_url}{progress_id}"
+        progress_response = requests.get(progress_url, headers=headers)
+        progress_response.raise_for_status()
+
+        progress_status = progress_response.json()["result"]["status"]
+        progress_percent = progress_response.json()["result"]["percentComplete"]
+        print(f"Export progress: {progress_percent}% complete")
+
+        if progress_status == "failed":
             raise Exception("Export failed.")
-        time.sleep(5)  # Wait for 5 seconds before checking again
 
-def download_file(access_token, file_url, output_path):
-    """
-    Download the exported file and save it locally.
-    """
-    headers = {"Authorization": f"Bearer {access_token}"}
-    response = requests.get(file_url, headers=headers)
-    response.raise_for_status()
-    with open(output_path, "wb") as file:
-        file.write(response.content)
-    print(f"File downloaded successfully: {output_path}")
+    file_id = progress_response.json()["result"]["fileId"]
 
-if __name__ == "__main__":
+    # Step 3: Downloading the exported file
+    download_url = f"{base_url}{file_id}/file"
+    download_response = requests.get(download_url, headers=headers, stream=True)
+    download_response.raise_for_status()
+
+    # Step 4: Unzipping the downloaded file
+    output_dir = "MyQualtricsDownload"
+    os.makedirs(output_dir, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(download_response.content)) as zf:
+        zf.extractall(output_dir)
+
+    print(f"Export complete. Files extracted to '{output_dir}'.")
+    return os.path.join(output_dir, "response.csv")
+
+
+def convert_to_xlsx(csv_file: str, output_xlsx: str) -> None:
+    """
+    Convert CSV to XLSX for better usability.
+    """
+    df = pd.read_csv(csv_file)
+    df.to_excel(output_xlsx, index=False)
+    print(f"File converted to XLSX: {output_xlsx}")
+
+
+def main():
+    """
+    Main function to execute the Qualtrics export and conversion process.
+    """
+    api_token = os.getenv("APIKEY")
+    data_center = os.getenv("DATACENTER")
+    survey_id = os.getenv("SURVEYID")  # Survey ID from .env
+    file_format = os.getenv("FILEFORMAT", "csv")  # Default to CSV if not specified
+
+    if not api_token or not data_center or not survey_id:
+        print("Environment variables 'APIKEY', 'DATACENTER', and 'SURVEYID' are required.")
+        return
+
     try:
-        # Step 1: Get access token
-        token = get_access_token(CLIENT_ID, CLIENT_SECRET)
-        print("Access token generated successfully.")
+        # Export survey responses
+        csv_file = export_survey(api_token, survey_id, data_center, file_format)
 
-        # Step 2: Export survey responses
-        progress_id = export_survey_responses(token)
-
-        # Step 3: Monitor progress
-        file_url = check_export_progress(token, progress_id)
-
-        # Step 4: Download the exported file
-        output_file = "survey_responses.csv"
-        download_file(token, file_url, output_file)
+        # Convert CSV to XLSX
+        output_xlsx = "MyQualtricsDownload/cleaned_responses.xlsx"
+        convert_to_xlsx(csv_file, output_xlsx)
 
     except Exception as e:
         print(f"An error occurred: {e}")
+
+
+if __name__ == "__main__":
+    main()
+
+
